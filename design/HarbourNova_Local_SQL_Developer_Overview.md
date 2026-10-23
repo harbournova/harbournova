@@ -78,7 +78,7 @@ FROM Customers AS c
 LEFT JOIN Orders AS o
     ON o.customer_id = c.customer_id
 GROUP BY CustomerId, CustomerName
-ORDER BY OrderCount DESC, CustomerId;
+ORDER BY OrderCount DESC, CustomerId
 ```
 
 This produces one row per customer, including customers with no matching orders. Assuming `order_id` is non-NULL on actual orders, `COUNT(o.order_id)` reports zero for an unmatched customer. `COUNT(*)` would count the NULL-extended join row instead, which is a useful example of why normal SQL semantics matter locally too.
@@ -97,7 +97,7 @@ The same approach applies to reconciliation, duplicate detection, exception list
 
 HN supplies query values through named, typed bindings. A placeholder such as `:customerId` refers to a supplied value; it is not a request to splice that value into the SQL Text.
 
-Assuming `curAllOrders` already refers to a Cursor, a typical call looks like this:
+Assuming `curAllOrders` already refers to a Cursor and `iCustomerId` is an HN variable declared as `Integer`, the explicit source-and-binding form of the call looks like this:
 
 ```harbour
 cSQL := "SELECT o.order_id, o.customer_id " + ;
@@ -108,8 +108,7 @@ aSources := { { "orders", curAllOrders } }
 
 aBindings := { ;
     { "Name" => "customerId", ;
-      "Value" => iCustomerId, ;
-      "Type" => "Integer" } ;
+      "Value" => iCustomerId } ;
 }
 
 curCustomerOrders := NULL
@@ -121,11 +120,26 @@ IF nRows < 0
 ENDIF
 ```
 
+The parameter name and the HN variable name have separate roles:
+
+| Part of the example | Meaning |
+| --- | --- |
+| `o.customer_id` | The field being compared. |
+| `:customerId` | The named parameter in the SQL Text. |
+| `"Name" => "customerId"` | The binding name that matches the SQL parameter, without its leading colon. |
+| `"Value" => iCustomerId` | The HN variable whose value supplies that parameter. |
+
+The SQL therefore uses `:customerId`, matching `"Name" => "customerId"`. The variable supplying the value is `iCustomerId`; its `i` prefix does not become part of the SQL parameter name. HN evaluates the `"Value"` expression when constructing the binding. The binding name does not ask the SQL executor to look up an HN variable by that name.
+
+**The binding's `"Type"` property is optional when the supplied variable is typed.** HN uses the variable's declared type. In this example, `iCustomerId` is declared as `Integer`, so the binding needs only `"Name"` and `"Value"`. An explicit `"Type" => "Integer"` can still be included to state the contract directly. Explicit type information is also useful for a value such as a bare `NULL` when no declared type is available. Inferring the type does not mean parsing Text that happens to contain digits or deriving a type from the variable's spelling.
+
+The SQL Text needs no terminating semicolon. The semicolons outside the quoted SQL Text in the HN code are line-continuation characters.
+
 `hn_SQLSelect()` returns the number of result rows on success. It publishes the result through the destination reference. A recoverable query failure returns `-1`, with the structured HN error available through `hn_SQLLastError()`.
 
 Bindings preserve their declared types even when their values are NULL. Text values remain data when they contain quotes or other characters that would have special meaning inside SQL syntax. Scalar bindings are captured once for the query, so changing the original binding collection during execution does not change the values already captured.
 
-Explicit source registration is equally useful. In this example, `orders` means the Cursor supplied in `aSources`. The query does not depend on an unrelated routine having selected the expected ambient alias.
+In this explicit source-registration example, `aSources` associates the SQL source name `orders` with `curAllOrders`. The SQL alias `o` is the short name used to refer to that source within the query.
 
 ## HN logic can participate in SQL expressions
 
@@ -137,7 +151,7 @@ For example, an application that defines `CustomerLabel()` can use it to constru
 SELECT c.customer_id AS CustomerId,
        CustomerLabel(c.customer_code, c.customer_name)
            AS Label TYPE Text(MaxLength = 160)
-FROM Customers AS c;
+FROM Customers AS c
 ```
 
 The function belongs to the application. The query specifies where its result belongs in the output, and the `TYPE` annotation specifies the output contract.
@@ -158,7 +172,7 @@ SELECT c.customer_id AS CustomerId TYPE Integer NOT NULL,
            TYPE Text(ASCII, MaxLength = 12) NOT NULL,
        c.customer_name AS CustomerName
            TYPE Text(MaxLength = 120, MaxStorageBytes = 480)
-FROM Customers AS c;
+FROM Customers AS c
 ```
 
 These declarations make several promises explicit:
@@ -195,7 +209,7 @@ When a query directly selects a field, its declared value metadata follows that 
 
 ```sql
 SELECT c.customer_name AS CustomerName
-FROM Customers AS c;
+FROM Customers AS c
 ```
 
 Renaming the field does not make it lose its type contract. This remains true when the query returns no rows, or when every selected value is NULL. The schema comes from declarations rather than from inspecting the first row or measuring the longest value currently present.
@@ -244,7 +258,17 @@ The same principle applies to identifiers. A key should retain its exact value t
 
 ### NULL and time retain their meaning
 
-Local SQL uses SQL's three-valued logic. A comparison involving NULL can be unknown; `WHERE` and `HAVING` retain rows for which the condition is true. `IS NULL` expresses a NULL test directly. Preserving NULL from the backend prevents an unknown value from being mistaken for an actual zero, false, or empty Text value. See [PostgreSQL's comparison semantics](https://www.postgresql.org/docs/18/functions-comparison.html).
+**`NULL` is a valid keyword directly inside a Local SQL string.** It does not have to be passed through a binding. For example, a query can test for missing customer identifiers:
+
+```sql
+SELECT o.order_id, o.customer_id
+FROM Orders AS o
+WHERE o.customer_id IS NULL
+```
+
+Local SQL uses SQL's three-valued logic. A comparison involving NULL can be unknown; `WHERE` and `HAVING` retain rows for which the condition is true. Use `IS NULL` or `IS NOT NULL` to test for missing values, rather than `= NULL` or `<> NULL`. If the value bound to `:customerId` is NULL, `o.customer_id = :customerId` likewise does not become an `IS NULL` test. Preserving NULL from the backend prevents an unknown value from being mistaken for an actual zero, false, or empty Text value. See [PostgreSQL's comparison semantics](https://www.postgresql.org/docs/18/functions-comparison.html).
+
+The SQL keyword and the binding's type metadata serve different purposes. SQL `NULL` expresses the absence of a value. A typed nullable HN variable retains its declared type even when its current value is NULL, so its binding can omit `"Type"` when that declared type is available. A bare NULL value without a declared type supplies no type information by itself.
 
 Temporal fidelity likewise requires explicit distinctions. A date is different from a timestamp, and a local timestamp differs from an instant interpreted with time-zone rules. Backend mappings must preserve the information actually supplied by the source. For example, PostgreSQL `timestamptz` does not retain the originally entered time-zone name; an adapter cannot reconstruct metadata the server no longer holds. See [PostgreSQL's date/time types](https://www.postgresql.org/docs/18/datatype-datetime.html).
 
@@ -296,7 +320,7 @@ SELECT t.customer_id AS CustomerId,
        COUNT(*) AS OpenTicketCount
 FROM Tickets AS t
 WHERE t.status = :openStatus
-GROUP BY t.customer_id;
+GROUP BY t.customer_id
 ```
 
 Here, `:openStatus` is a typed Text binding. The result can be supplied to another query as `TicketCounts`:
@@ -309,7 +333,7 @@ SELECT o.CustomerId,
 FROM CustomerOrderCounts AS o
 LEFT JOIN TicketCounts AS t
     ON t.CustomerId = o.CustomerId
-ORDER BY o.OrderCount DESC, o.CustomerId;
+ORDER BY o.OrderCount DESC, o.CustomerId
 ```
 
 Each summary has at most one row per customer, so their join preserves that intended result shape. A customer with no matching ticket summary has NULL in `OpenTicketCount`; the presentation or an explicit application transformation can supply zero when that is the required report convention.
