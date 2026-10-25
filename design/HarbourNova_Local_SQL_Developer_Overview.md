@@ -6,17 +6,17 @@ Database servers are very good at selecting, joining, and summarizing the data t
 
 HarbourNova (HN) brings SQL into that part of the application through **Local SQL over native Cursors**.
 
-A backend query can produce a Cursor. Application code can also create and populate one. The application accesses these datasets through named WorkAreas, and Local SQL uses those same names to select, join, and summarize their data. WorkArea names can be local to a function and bound to ordinary typed variables. A query can populate a local WorkArea, create a result owned by a wider execution context, or supply row objects to HN code. Jobs and Tasks extend this workflow by allowing independent backend requests to run concurrently before their results are combined locally.
+A backend query can produce a Cursor. Application code can also create and populate one. The application accesses these datasets through scoped WorkArea bindings, and Local SQL uses the visible source names to select, join, and summarize their data. A query supplies its result through an explicit reference to a receiving variable: a WorkArea, a single row object, or an Array of row objects. LOCAL, STATIC, TASK STATIC, and application GLOBAL declarations give WorkArea bindings their normal visibility and storage lifetime. Jobs and Tasks extend this workflow by allowing independent backend requests to run concurrently before their results are combined locally.
 
 The value comes from the combination: SQL, typed local data, ordinary HN code, and concurrent work all participate in one programming model.
 
 ## What “Local SQL” means
 
-Local SQL executes inside the HN application against data that the application already holds. Names in `FROM` and `JOIN` resolve through the current function's WorkArea namespace and permitted wider contexts. The query uses familiar SQL concepts such as `SELECT`, `FROM`, `WHERE`, joins, grouping, and ordering.
+Local SQL executes inside the HN application against data that the application already holds. Names in `FROM` and `JOIN` resolve through the executing code's permitted WorkArea bindings. Local/formal bindings, visible retained bindings, and the owning application's globals participate according to scope. Library and HNB code retain their own boundaries; application globals are not a fallback namespace for their SQL. The query uses familiar SQL concepts such as `SELECT`, `FROM`, `WHERE`, joins, grouping, and ordering.
 
 The reference dialect is PostgreSQL, with a defined supported subset and selected HN extensions. Two useful extensions are optional `TYPE` declarations on output columns and the ability to reference a selected column's alias in `HAVING`.
 
-SQL is supplied as HN Text. It can be a fixed query, Text assembled by application code, or the output of a query builder. Application values are supplied through an ordinary binding Hash. The SQL specifies the result mode: `INTO CURSOR WorkAreaName` creates a result and assigns its WorkArea to a matching registered local destination, or publishes a named result in the applicable wider context. Object and Array results use an actual HN destination variable passed by reference.
+SQL is supplied as HN Text. It can be a fixed query, Text assembled by application code, or the output of a query builder. Application values are supplied through an ordinary binding Hash. The SQL specifies the result mode: `INTO CURSOR`, `INTO OBJECT`, or `INTO OBJECTS ARRAY`. The call supplies the actual receiving variable through `xResult=@destination`. Source names remain part of SQL; the HN compiler resolves the destination-variable expression under ordinary language visibility and reference-argument rules.
 
 For example, a query can use `ListOfCustomers` and `ListOfOrders` even when those datasets came from different servers. Once materialized as Cursors and opened through those WorkAreas, their original locations are separate from the local relational operation.
 
@@ -45,7 +45,7 @@ HN separates the data from a particular navigation position:
 | --- | --- |
 | **Cursor** | The typed dataset: schema, records, field values, NULL states, and associated data structures. |
 | **WorkArea** | A navigation view over a Cursor, with its own current record position and active order. |
-| **Alias** | A name in a scope that resolves through a binding to a WorkArea; a declared local can reserve that name while its value is still NULL. |
+| **Alias** | A name in a permitted scope that resolves through a binding to a WorkArea; a declared WorkArea binding can exist while its value is still NULL. |
 
 Separate WorkAreas can refer to the same Cursor while navigating independently. Moving one view to another record does not move the other view. Two references to the same WorkArea, however, still refer to the same navigation state.
 
@@ -55,7 +55,7 @@ The examples use descriptive WorkArea names directly. SQL relation aliases remai
 
 Local SQL reads its sources independently of their current WorkArea record pointers. A report query therefore does not have to inherit whichever record a screen or another routine last visited.
 
-A materialized SQL result is independent of its input WorkAreas. A local result follows the lifetime of its owning references; a result published under a wider-context alias has the ownership of that context. Both remain usable after the query call returns. Closing an input WorkArea does not invalidate the separately materialized result.
+A materialized SQL result is independent of its input WorkAreas. The receiving variable holds a reference to the new view, and that reference follows its declaration's lifetime. Other returned, captured, or retained references can keep the result alive after that variable leaves scope or is reassigned. Closing an input WorkArea does not invalidate the separately materialized result.
 
 ## What Local SQL can do
 
@@ -74,6 +74,8 @@ The query surface covers a substantial range of everyday relational work:
 | Define an output contract | Optional `TYPE` annotations on selected expressions. |
 | Inspect a query's output schema | `hn_SQLDescribe()` without executing its row expressions. |
 
+In the SQL-only examples below, `cSQL` denotes the complete SQL Text shown in the preceding block. The accompanying HN call supplies the destination and any required bindings. Check each call's return value before consuming its new result; later examples omit repetitive application-specific error handling.
+
 For example, given the local WorkAreas `ListOfCustomers` and `ListOfOrders`:
 
 ```sql
@@ -85,10 +87,18 @@ LEFT JOIN ListOfOrders
     ON ListOfOrders.customer_id = ListOfCustomers.customer_id
 GROUP BY CustomerId, CustomerName
 ORDER BY OrderCount DESC, CustomerId
-INTO CURSOR ListOfCustomerOrderCounts
+INTO CURSOR
 ```
 
-This creates `ListOfCustomerOrderCounts`, with one row per customer, including customers with no matching orders. Assuming `order_id` is non-NULL on actual orders, `COUNT(ListOfOrders.order_id)` reports zero for an unmatched customer. `COUNT(*)` would count the NULL-extended join row instead, which is a useful example of why normal SQL semantics matter locally too.
+The receiving variable and call are:
+
+```harbour
+LOCAL ListOfCustomerOrderCounts WorkArea
+
+nRows := hn_SQLSelect(cSQL, xResult=@ListOfCustomerOrderCounts)
+```
+
+On success, `ListOfCustomerOrderCounts` contains one row per customer, including customers with no matching orders. Assuming `order_id` is non-NULL on actual orders, `COUNT(ListOfOrders.order_id)` reports zero for an unmatched customer. `COUNT(*)` would count the NULL-extended join row instead, which is a useful example of why normal SQL semantics matter locally too.
 
 The application can add:
 
@@ -112,11 +122,13 @@ LOCAL ListOfCustomerOrders WorkArea
 cSQL := "SELECT ListOfOrders.order_id, ListOfOrders.customer_id " + ;
         "FROM ListOfOrders " + ;
         "WHERE ListOfOrders.customer_id = :customerId " + ;
-        "INTO CURSOR ListOfCustomerOrders"
+        "INTO CURSOR"
 
 hBindings := { "customerId" => iCustomerId }
 
-nRows := hn_SQLSelect(cSQL, hBindings=hBindings)
+nRows := hn_SQLSelect(cSQL, ;
+    hBindings=hBindings, ;
+    xResult=@ListOfCustomerOrders)
 
 IF nRows < 0
     errSQL := hn_SQLLastError()
@@ -124,7 +136,7 @@ IF nRows < 0
 ENDIF
 ```
 
-The declaration registers `ListOfCustomerOrders` as a local WorkArea name and initializes its value to NULL. The query reads `ListOfOrders`, materializes its result, and assigns the result's WorkArea reference to that registered local destination. `hn_SQLSelect()` itself returns the number of result rows; it supplies no Cursor storage handle through its return value or `xResult`. A recoverable query failure returns `-1`, with the structured HN error available through `hn_SQLLastError()`.
+The declaration registers `ListOfCustomerOrders` as a local WorkArea binding and initializes its value to NULL. The query reads `ListOfOrders`, materializes its result, and assigns a new WorkArea reference through `xResult=@ListOfCustomerOrders`. The output argument identifies the actual receiving variable even while its value is NULL. `hn_SQLSelect()` itself returns the number of result rows. A recoverable query failure returns `-1`, with the structured HN error available through `hn_SQLLastError()`. The output is a WorkArea; its separate `:CursorHandle` property exposes the underlying managed Cursor when needed.
 
 ### SQL names and HN variable names have separate roles
 
@@ -134,7 +146,7 @@ The declaration registers `ListOfCustomerOrders` as a local WorkArea name and in
 | `:customerId` | The named placeholder in the SQL Text. |
 | `"customerId"` | The matching Hash key, without the leading colon. |
 | `iCustomerId` | The HN variable whose current value is supplied. |
-| `ListOfCustomerOrders` | The WorkArea target name, resolving to the registered local destination in this example. |
+| `@ListOfCustomerOrders` | The assignable receiving variable, resolved as an HN reference argument. Its name is not part of the SQL Text. |
 
 The Hash key does not have to match the HN variable name. The same SQL can receive a value from a local variable, an object property, or a calculated expression. These names act as placeholders, with values bound directly through the native interface. Values are never pasted into the SQL Text, so quotes and other SQL-looking characters inside Text remain ordinary data.
 
@@ -160,7 +172,15 @@ To select orders without a customer, write the condition directly:
 SELECT ListOfOrders.order_id, ListOfOrders.customer_id
 FROM ListOfOrders
 WHERE ListOfOrders.customer_id IS NULL
-INTO CURSOR ListOfOrdersWithoutCustomers
+INTO CURSOR
+```
+
+Supply the output explicitly:
+
+```harbour
+LOCAL ListOfOrdersWithoutCustomers WorkArea
+
+nRows := hn_SQLSelect(cSQL, xResult=@ListOfOrdersWithoutCustomers)
 ```
 
 Use `IS NOT NULL` for the opposite test. An application that searches either for a particular customer or for missing customer identifiers chooses the appropriate SQL condition; only the first form needs the `customerId` binding.
@@ -179,23 +199,27 @@ LOCAL ListOfCustomerOrders WorkArea
 
 This declaration initializes the variable to NULL and registers `ListOfCustomerOrders` in the current function invocation's WorkArea namespace. No initializer is required. The type annotation constrains a non-NULL value to a WorkArea reference; NULL remains permitted.
 
-The declaration creates a binding, not a dataset. Until a WorkArea is assigned, there is no Cursor to query or traverse through that binding. The name is nevertheless available as a destination for `INTO CURSOR ListOfCustomerOrders`.
+The declaration creates a binding, not a dataset. Until a WorkArea is assigned, there is no Cursor to query or traverse through that binding. The receiving slot is nevertheless available through `@ListOfCustomerOrders`. An output argument does not require an existing WorkArea or Cursor.
 
-Typed WorkArea parameters participate in the same naming mechanism. Each invocation has its own local names, so recursive calls and separate functions can use readable names such as `ListOfOrders` without colliding with one another.
+Typed WorkArea parameters participate in the same source-naming mechanism. Each invocation has its own local bindings, so recursive calls and separate functions can use readable names without colliding with one another. A declaration must still obey the rule against hiding a GLOBAL that is visible unqualified in that scope.
 
-Name resolution first checks the current function's registered WorkArea bindings, then any permitted wider execution context. A registered local reserves its name even while its value is NULL. Attempting to use that NULL local as a source produces an error; it does not silently select a wider-context WorkArea with the same spelling.
+Source-name resolution follows the executing code's permitted scopes: the applicable local/formal bindings, visible retained bindings, and owner-wide bindings. A nearer WorkArea binding remains authoritative even while its value is NULL. Attempting to use it as a source produces an error; lookup does not skip it to find a different populated binding. The no-shadowing rule separately rejects a local or retained declaration that would hide an unqualified-visible GLOBAL.
 
-### SQL can locate the destination before it has a value
+### A reference identifies the destination even while NULL
 
-`FROM ListOfOrders` resolves a binding and reads its current WorkArea value. `INTO CURSOR ListOfCustomerOrders` resolves a destination binding and publishes a newly created WorkArea into its variable. The destination can be found while its value is still NULL.
+`FROM ListOfOrders` resolves a source binding and reads its current WorkArea value. `INTO CURSOR` chooses the result representation, and `xResult=@ListOfCustomerOrders` identifies the receiving variable. Destination selection does not inspect the variable's initial NULL value or search for its name inside SQL Text.
 
-This registration is specific to WorkArea bindings. SQL remains ordinary runtime Text, and the executor resolves its names against the registered namespace. It does not inspect arbitrary local variables or require every query to be a compile-time string literal. Scalar values still enter SQL through `hBindings`.
+The compiler resolves the HN destination expression, its visibility, and its assignability. It constructs a reference to the correct invocation-local, retained, Task-specific, or global cell. The actual storage is selected for the executing invocation or Task as applicable. This is independent of whether the SQL is a literal or assembled at runtime.
 
-The complete result is prepared before publication. On success, the local receives the new WorkArea. If the local already holds a WorkArea, successful publication replaces that reference; other references to the previous view retain their normal ownership. A recoverable query failure leaves the destination's earlier value unchanged.
+The executor still parses the SQL result mode and validates that the supplied output reference can receive that representation. Missing output references and known incompatible destinations fail before record processing. Arbitrary SQL Text does not become a compile-time SQL program merely because its destination variable is compiled.
 
-A successful zero-row query still assigns a valid WorkArea with the result schema. NULL means no WorkArea has been supplied, whereas an empty result is a usable dataset containing zero records.
+The complete result is prepared before final publication. On success, the destination receives a new WorkArea reference. If it already holds a WorkArea, publication replaces that reference; other owners of the previous view retain it normally. Assigning a new view does not rebind the Cursor inside the previous view.
 
-When a target name has no registered local binding, `INTO CURSOR` publishes the named result in the applicable wider context. That form has context ownership and retains the rule against silently replacing an existing alias.
+A successful zero-row query still assigns a valid WorkArea with the result schema. NULL means no WorkArea has been supplied; an empty result is a usable dataset containing zero records.
+
+The native result form has one destination authority. `INTO CURSOR Name` is not the HN Cursor-output syntax, and supplying a name as well as `xResult` is rejected. A missing destination never implicitly creates a PUBLIC-style name or publishes a result in a wider scope.
+
+Failure prevents the engine from publishing a partial replacement. Independent callback assignments and concurrent application writes retain their normal effects; the query does not roll them back. The normal reference-lifetime and checked-assignment path remains responsible for safe publication, including shared STATIC or GLOBAL destinations.
 
 ### Pass sources to a helper and return its local result
 
@@ -214,11 +238,13 @@ FUNCTION BuildCustomerOrders(ListOfSourceOrders WorkArea Required, ;
             "ListOfSourceOrders.customer_id " + ;
             "FROM ListOfSourceOrders " + ;
             "WHERE ListOfSourceOrders.customer_id = :customerId " + ;
-            "INTO CURSOR ListOfCustomerOrders"
+            "INTO CURSOR"
 
     hBindings := { "customerId" => iCustomerId }
 
-    nRows := hn_SQLSelect(cSQL, hBindings=hBindings)
+    nRows := hn_SQLSelect(cSQL, ;
+        hBindings=hBindings, ;
+        xResult=@ListOfCustomerOrders)
 
     IF nRows < 0
         // hn_SQLLastError() provides the structured query error.
@@ -252,7 +278,7 @@ The three forms below have distinct roles:
 | --- | --- |
 | `ListOfOrders` in an HN expression | The WorkArea value currently stored in that variable. |
 | `"ListOfOrders"` | Text containing a name; resolving it requires a WorkArea namespace. |
-| `@ListOfOrders` as a by-reference argument | The assignable variable slot, for an API that explicitly accepts an output or reference argument. |
+| `@ListOfOrders` as a by-reference argument | The assignable variable slot; `hn_SQLSelect(..., xResult=@ListOfOrders)` can place a new WorkArea reference into it. |
 
 The automatic alias is associated with the scoped binding. It is not a unique permanent name stored on the Cursor. Two local variables can hold the same WorkArea, and a function parameter can provide another local name for that view.
 
@@ -261,6 +287,154 @@ Local names disappear when their scope ends. Local references are released throu
 Selection state belongs to the function's WorkArea context, so selecting a WorkArea in a helper does not permanently change the caller's selected WorkArea. Navigation state belongs to the WorkArea value itself: if the helper and caller share the same WorkArea, they share its record position. Separate WorkAreas over the same Cursor provide independent navigation.
 
 Releasing one variable's reference is also different from explicitly closing a WorkArea. Other retained references can keep a view alive after one variable is cleared. Explicitly closing that shared view affects references to that same view.
+
+## WorkArea scope, retained state, and application globals
+
+A WorkArea variable has both a declaration and a current value. Its declaration determines where code can name the variable and which storage cell that name identifies. Its value is either NULL or a native WorkArea reference. The WorkArea itself owns its navigation state and Cursor binding. Keeping these responsibilities separate makes local datasets, retained views, and deliberately shared application state follow the same language rules.
+
+### Scope and storage are separate choices
+
+The scope of a declaration controls name visibility. Its storage class controls whether each invocation or Task receives a separate cell, or whether authorized code shares one retained cell.
+
+| Declaration and location | Code that can name it | Storage ownership |
+| --- | --- | --- |
+| LOCAL or a formal parameter | The permitted lexical scope of the current routine invocation | Invocation-local binding; a by-reference parameter refers to the supplied cell under normal lifetime rules. |
+| STATIC inside a routine or method | That routine or method's permitted scope | One retained cell for that declaration, shared across authorized Tasks. |
+| TASK STATIC inside a routine or method | That routine or method's permitted scope | A separate retained cell for each logical Task. |
+| STATIC outside routines in an `.hnp` file | Functions, methods, and event bodies defined in that source unit, subject to normal lexical rules | One source-unit-visible retained cell, shared across authorized Tasks. |
+| TASK STATIC outside routines in an `.hnp` file | The same source-unit scope | A separate retained cell for each logical Task. |
+| LIBLOCAL STATIC | Authorized source units of the defining library | One retained cell owned by the admitted library instance and generation. |
+| LIBLOCAL TASK STATIC | Authorized source units of the defining library | A separate retained cell for each Task using that library instance. |
+| GLOBAL in application code | The application's selected source units | One application-runtime-owned retained cell, shared across authorized Tasks. |
+
+An `.hnp` filename does not create an independent runtime owner. A source unit belongs to the application or library into which it is built. An HNB Module is a compiled HN bytecode module and preserves its defining module and library boundaries.
+
+TASK STATIC separates the variable cells. Assigning the same WorkArea reference to two such cells still gives them the same view. Separate navigation requires separate WorkAreas, even when those views use permitted shared Cursor storage. An ordinary LOCAL already belongs to its invocation; no additional TASK LOCAL declaration is needed.
+
+### GLOBAL is a general typed declaration
+
+GLOBAL supports ordinary storable HN values under their normal type and ownership contracts. WorkArea is one useful application of that facility. Text, Integer, Boolean, and other supported values can also have global declarations.
+
+Declarations appear outside routines and can be distributed among the application's selected source files:
+
+```harbour
+// Customers.hnp
+GLOBAL SharedCustomers WorkArea
+GLOBAL ApplicationTitle Text := "Order Management"
+
+// Orders.hnp
+GLOBAL SharedOrders WorkArea
+GLOBAL SharedOrderSummary WorkArea
+GLOBAL CompletedRequests Integer := 0
+```
+
+These declarations do not need to be collected into one special `.hnp` file. Each global has one authoritative definition in its owning application scope. Other application source units use that declaration without repeating it or adding MEMVAR declarations.
+
+A WorkArea declaration starts with NULL and allocates no WorkArea or Cursor. When code assigns a WorkArea, the cell owns its reference through normal retention rules. Replacing or clearing the cell releases that ownership; other valid references can keep the previous view alive.
+
+Initialization follows the retained-storage rules for the declared type. Source-unit GLOBAL initialization is established at first actual access, including a write or passing the variable by reference. Concurrent first accesses coordinate around the same initialization state. Initialization failures and dependency cycles follow the normal retained-variable contract. GLOBAL does not impose one universal default value on every datatype or make source-list order an initialization order.
+
+The global cell belongs to one application runtime lifetime. Starting another Task does not copy its value or create another global cell. Separate application runtime instances have separate globals, including independently running application processes.
+
+### Uniqueness and hiding are checked during the build
+
+Two active definitions of the same global identifier in the same owner scope are an error, even when their types and initial values match. Identifier comparison follows HN's normal identifier rules. Only source units and conditional declarations selected for the target contribute to its declaration environment.
+
+HN also rejects an ordinary narrower variable declaration that would hide a GLOBAL visible unqualified in that scope. This includes LOCAL declarations, nested lexical locals, formal parameters, routine or file STATIC declarations, TASK STATIC declarations, and applicable owner-wide retained declarations. An application GLOBAL named `SharedOrders` therefore cannot be hidden by a same-named parameter in an application function.
+
+The rule concerns visibility in the actual owner scope. A separately compiled library can use its own local `SharedOrders` because the application's global is not visible there. Field selectors, explicitly qualified object members, and SQL column aliases have their own resolution contexts; they do not become conflicting variable declarations merely because their spelling matches a global.
+
+These checks are independent of source-file order. They also apply to incremental builds. Adding a new GLOBAL can conflict with a declaration in an otherwise unchanged source unit, including a unit that has never referred to that global. The compiler's declaration information and build dependencies account for that change before cached compilation results are reused.
+
+### SQL reads scoped sources and receives an explicit destination
+
+WorkArea source lookup follows the permitted lexical and owner environment: local bindings and parameters, applicable retained bindings, then the globals visible to that code. A registered NULL binding is an invalid source. Lookup does not skip it in search of a usable wider value. The no-hiding rule prevents narrower application declarations from concealing visible application globals in the first place.
+
+Only WorkArea bindings participate in this alias mechanism. Defining a global Text or Integer does not make its identifier a SQL data source, and SQL Text does not gain general reflection over ordinary variables.
+
+A result destination is supplied through an actual reference argument. Given a populated `SharedOrders`, application code can publish a summary into its declared global:
+
+```harbour
+cSQL := "SELECT SharedOrders.customer_id, COUNT(*) AS OrderCount " + ;
+        "FROM SharedOrders " + ;
+        "GROUP BY SharedOrders.customer_id " + ;
+        "INTO CURSOR"
+
+nRows := hn_SQLSelect(cSQL, xResult=@SharedOrderSummary)
+```
+
+The compiler identifies `SharedOrderSummary` as the receiving declaration. The runtime reaches its actual cell through the reference argument. The SQL executor resolves `SharedOrders` as a source in the application's permitted WorkArea scope. These operations have different purposes and need no duplicate destination name inside the SQL.
+
+The newly created WorkArea becomes the global's value only through successful result publication. A zero-row result still supplies a valid schema-bearing WorkArea. Assigning the new reference does not rebind the Cursor inside the previous WorkArea or redirect other holders of that previous view.
+
+### Libraries and HNB modules preserve their own scope
+
+Application globals are visible within application code. Independently owned libraries and HNB modules cannot discover or access those declarations by name. Static linking preserves this boundary just as dynamic loading does. Calling a library routine in an application's current Task does not import the application's variable scope into that routine.
+
+The same restriction governs SQL executed in library or HNB scope. Its source resolver does not fall back to the host application's globals or search arbitrary caller frames. Passing a SQL string containing an application-private WorkArea name does not pass that WorkArea.
+
+Application code supplies dependencies explicitly through parameters, objects, Callables, or other supported interfaces. A WorkArea parameter provides a local binding inside the receiving routine. An explicitly supplied output reference permits assignment to that particular receiving variable under its normal type, lifetime, and sharing rules. It does not expose the caller's other bindings or transfer the caller's private SQL source namespace.
+
+Library-private retained state uses LIBLOCAL STATIC and LIBLOCAL TASK STATIC. A library's declared public interface is reached through its consumer alias and export rules. Neither the alias nor the existence of application GLOBALs makes private library declarations public. The application global namespace and a library's public export surface remain separate contracts.
+
+### Shared cells and shared values require different guarantees
+
+An individual read or direct assignment of a shared GLOBAL cell is coherent and ownership-safe across authorized Tasks. Each operation has one observable point of effect. A reader obtains a valid value; reference acquisition preserves the referenced value's lifetime against concurrent replacement of the cell.
+
+This is the same basic cell guarantee used for shared scalar STATIC storage. It does not require one particular lock or CPU instruction for every datatype. Costs depend on representation, access patterns, contention, and lifetime handling. Recognizing a declaration through stable symbol metadata is distinct from acquiring or replacing its shared value.
+
+Separate operations remain separate. A read followed by arithmetic and assignment is not an atomic increment, including ordinary shorthand compound assignment. A check followed by a later read can observe a changed global. Several assignments do not create a transaction or a coherent snapshot of multiple cells.
+
+When code needs to keep using the same WorkArea reference after checking it, it can capture that reference once in a distinct local:
+
+```harbour
+LOCAL OrdersView WorkArea
+
+OrdersView := SharedOrders
+
+IF OrdersView != NULL
+    ? OrdersView:RecordCount
+ENDIF
+```
+
+The local keeps the WorkArea it acquired even if another Task later changes `SharedOrders`. This does not copy the dataset, create an independent navigation view, or freeze the WorkArea's mutable state. Other operations on the same view still follow its own access contract.
+
+GLOBAL also does not promote a confined collection or resource into a shareable one. A mutable LOCAL collection remains confined even when a global holds its reference. WorkAreas, Cursors, objects, and native resources retain their own sharing, access, and lifetime rules. A shared binding alone grants no new cross-Task authority over its referent.
+
+SQL publication through a global output reference uses that cell's normal checked assignment path. Eliminating destination-name lookup does not eliminate synchronization or turn an entire query into a multi-Task transaction. A failed engine publication does not assign a partial result; independent callback assignments and other application writes retain their normal effects.
+
+### GLOBAL and ApplicationValues serve different needs
+
+`ApplicationValues()` returns the application-runtime-owned managed container shared by participating HN Tasks. Its keys are selected at runtime, and its entries have explicit fixed type contracts. It is not an untyped substitute for variable declarations.
+
+| Property | GLOBAL | ApplicationValues entry |
+| --- | --- | --- |
+| Identity in source | A declared identifier known to the compiler | A key supplied through the container interface |
+| Type contract | The global declaration | An explicit fixed entry contract |
+| Lifetime | The owning application's retained cell | The managed entry lifetime, including explicit removal and recreation |
+| Individual access | Coherent, ownership-safe cell access | The container's managed entry operations |
+| Compound numeric updates | Ordinary read/modify/write is not implicitly atomic | Specifically supported single-entry numeric updates are atomic complete operations |
+| Mutable collection handling | The stored value retains its existing ownership and sharing contract | Supported Array/Hash inputs become independently owned managed state with protected nested access |
+
+ApplicationValues distinguishes an absent entry from an existing entry containing NULL. Duplicate entry definition is an error. Removing and recreating an entry establishes a new lifetime; stale revisions or guards cannot silently retarget to it. Copy-out and checked replacement support deliberate updates without exposing an ordinary live mutable child that bypasses the container's protection.
+
+Use GLOBAL for statically declared application state whose name and type belong in the program's contract. Use ApplicationValues when runtime-selected keys, managed entry lifetimes, or its entry-level operations fit the problem. No automatic mirroring connects a global declaration to a similarly named entry. The application-global visibility boundary does not disable this separate runtime service.
+
+### Compiler metadata supports the normal build workflow
+
+Each selected `.hnp` source unit contributes compiler-owned `.hnp.sig` metadata. Global declarations add owner, identity, declared type and constraints, and dependency information to that metadata. The build collects the selected declarations before compiling bodies against the completed environment. Duplicate definitions, visibility violations, incompatible uses, and global-hiding conflicts receive build diagnostics.
+
+Applications continue using their ordinary source lists and build stages. They do not maintain a second global-declaration file or repeat declarations in every consumer. The compiler remains responsible for understanding HN source; the Rust build tool consumes its metadata rather than independently parsing HN declarations.
+
+Compiled variable accesses can use their resolved declaration identities. SQL supplied as runtime Text still resolves its source names in the appropriate context and validates its result mode against the supplied output reference. This preserves dynamically assembled SQL without making destination selection depend on a string search.
+
+### Inspecting names and live WorkAreas
+
+Inspection distinguishes visible bindings from distinct live WorkArea values. Several permitted names can refer to one view, and several views can share one Cursor. A declared NULL WorkArea binding is a visible name without a currently supplied view. A retained view can remain alive after one of its local names has gone out of scope.
+
+Inspection respects the caller's permitted owner scope. A membership snapshot can retain the WorkArea references it reports, while later assignments change the live bindings independently. Such retention preserves reference identity and lifetime; it does not freeze records, navigation, or Cursor binding state.
+
+`WorkAreaNumber` identifies a view within its owning registry. It does not supply ownership, make a hidden name visible, or authorize access from another Task. Registry storage can grow as views are admitted; the language does not require every WorkArea declaration to reserve an eager dataset or a fixed preallocated numeric slot.
 
 ## SELECT, SCAN, and explicit field access
 
@@ -274,15 +448,15 @@ SCAN ALL
 ENDSCAN
 ```
 
-`SELECT ListOfOrders` resolves the registered local name and selects its WorkArea. `SCAN ALL` traverses the applicable records from the beginning under the WorkArea's ordering and record-visibility rules. On each iteration, `ListOfOrders->Number` reads the field from the current record, and `?` prints that value to the normal standard-output stream.
+`SELECT ListOfOrders` resolves the visible WorkArea binding and selects its current WorkArea. `SCAN ALL` traverses the applicable records from the beginning under the WorkArea's ordering and record-visibility rules. On each iteration, `ListOfOrders->Number` reads the field from the current record, and `?` prints that value to the normal standard-output stream.
 
 The same name resolution is used by `SELECT ListOfOrders`, `ListOfOrders->Number`, and SQL `FROM ListOfOrders`. No parentheses or additional source map are needed merely because the WorkArea is local.
 
 Field access is explicit. `->` identifies a field in a record; `:` identifies a native property or method on the WorkArea value. This prevents a data field from colliding with a WorkArea property:
 
 ```harbour
-? ListOfOrders->RecCount     // A field named RecCount
-? ListOfOrders:RecCount      // The Cursor's record count
+? ListOfOrders->RecordCount    // A data field named RecordCount
+? ListOfOrders:RecordCount     // The Cursor's record count
 ```
 
 The source of a scan is retained for the traversal. Selecting another WorkArea in the body does not redirect its continuation; the originating WorkArea is restored as required for subsequent iterations and completion or unwind. A valid empty Cursor executes the body zero times. A local that still contains NULL is not a usable scan source.
@@ -302,8 +476,8 @@ WorkArea properties expose the navigation view and its underlying dataset direct
 | Property | Meaning |
 | --- | --- |
 | `ListOfOrders:WorkAreaNumber` | The numeric identifier of this WorkArea in its owning runtime registry. |
-| `ListOfOrders:Recno` | The WorkArea's current record number under HN navigation rules. |
-| `ListOfOrders:RecCount` | The total record count of the bound Cursor, or `-1` for an actual WorkArea with no usable Cursor bound. |
+| `ListOfOrders:RecordNumber` | The WorkArea's current record number under HN navigation rules. |
+| `ListOfOrders:RecordCount` | The total record count of the bound Cursor, or `-1` for an actual WorkArea with no usable Cursor bound. |
 | `ListOfOrders:CursorHandle` | A managed Cursor reference to the underlying dataset, or NULL when the WorkArea has no bound Cursor. |
 
 These properties are read-only observations. Reading them does not select the WorkArea, move its record pointer, or copy its records. `:CursorHandle` returns a retained Cursor reference with normal ownership.
@@ -316,11 +490,11 @@ Its scope is the owning runtime registry. A number does not make a local alias g
 
 ### Record position and record count answer different questions
 
-`:Recno` reports the record number in the Cursor's navigation model. It is not the value of an application field such as `Number`, and it is not the number of iterations already completed by a scan. An active index can change visit order without making those concepts equivalent.
+`:RecordNumber` reports the record number in the Cursor's navigation model. It is not the value of an application field such as `Number`, and it is not the number of iterations already completed by a scan. An active index can change visit order without making those concepts equivalent.
 
 Normal row-navigation boundaries distinguish position `0` for an unpositioned or before-first view from `N + 1` after the last record of a Cursor with `N` records. An empty Cursor remains at position `0`. Application code must not treat every position outside an actual record as the same state.
 
-`:RecCount` reports the underlying Cursor's total record count independently of the view's position or active order. It does not count the rows remaining after the current position or the rows accepted by an arbitrary `SCAN FOR` predicate. Record retention and visibility continue to follow the Cursor's deletion policy.
+`:RecordCount` reports the underlying Cursor's total record count independently of the view's position or active order. It does not count the rows remaining after the current position or the rows accepted by an arbitrary `SCAN FOR` predicate. Record retention and visibility continue to follow the Cursor's deletion policy.
 
 Two WorkAreas sharing one Cursor therefore share its record count while maintaining independent positions. A property read describes the current state; several separate reads do not create an atomic snapshot of concurrent changes.
 
@@ -328,20 +502,20 @@ Two WorkAreas sharing one Cursor therefore share its record count while maintain
 
 These states have different meanings:
 
-| State | `:RecCount` | `:CursorHandle` |
+| State | `:RecordCount` | `:CursorHandle` |
 | --- | --- | --- |
 | The variable contains NULL | Invalid NULL receiver; check the variable before property access. | Invalid NULL receiver; check the variable before property access. |
 | An actual WorkArea value has no usable Cursor bound | `-1`. | NULL. |
 | A WorkArea is bound to a valid empty Cursor | `0`. | A valid managed Cursor reference. |
 | A WorkArea is bound to a Cursor containing records | The record count. | A valid managed Cursor reference. |
 
-Allowing a variable to contain NULL does not make ordinary `:` access on NULL valid. A status check can account for the initial local state explicitly:
+Allowing a variable to contain NULL does not make ordinary `:` access on NULL valid. Invalid NULL-receiver access follows HN's controlled runtime-error path. For a local binding, a status check can account for its initial state explicitly:
 
 ```harbour
 IF ListOfOrders == NULL
     nRecordCount := -1
 ELSE
-    nRecordCount := ListOfOrders:RecCount
+    nRecordCount := ListOfOrders:RecordCount
 ENDIF
 ```
 
@@ -404,10 +578,18 @@ SELECT ListOfCustomers.customer_id AS CustomerId,
                      ListOfCustomers.customer_name)
            AS CustomerLabel TYPE Text(MaxLength = 160)
 FROM ListOfCustomers
-INTO CURSOR ListOfCustomerLabels
+INTO CURSOR
 ```
 
-The function belongs to the application. The selected alias names its output column, and the optional `TYPE` annotation states that column's contract.
+The application receives the result through:
+
+```harbour
+LOCAL ListOfCustomerLabels WorkArea
+
+nRows := hn_SQLSelect(cSQL, xResult=@ListOfCustomerLabels)
+```
+
+The function belongs to the application. The selected alias names its output column, and the optional `TYPE` annotation states that column's contract. Callable lookup follows the executing code's permitted function/module scope; the SQL does not grant access to otherwise hidden application declarations.
 
 ### Supply a callable through the binding Hash
 
@@ -425,7 +607,17 @@ SELECT ListOfCustomers.customer_id AS CustomerId,
                       ListOfCustomers.customer_name)
            AS CustomerLabel TYPE Text(MaxLength = 160)
 FROM ListOfCustomers
-INTO CURSOR ListOfBoundCustomerLabels
+INTO CURSOR
+```
+
+The output is explicit here too:
+
+```harbour
+LOCAL ListOfBoundCustomerLabels WorkArea
+
+nRows := hn_SQLSelect(cSQL, ;
+    hBindings=hBindings, ;
+    xResult=@ListOfBoundCustomerLabels)
 ```
 
 Here, `:customerLabel(...)` means call the supplied callable with the SQL expression arguments. A plain scalar placeholder such as `:customerId` reads its supplied value. Supplying a function reference does not itself execute the function.
@@ -457,7 +649,17 @@ SELECT ListOfOrders.order_id AS OrderId,
            AS OrderLabel TYPE Text(MaxLength = 160)
 FROM ListOfOrders
 WHERE ListOfOrders.customer_id = :customerId
-INTO CURSOR ListOfFormattedCustomerOrders
+INTO CURSOR
+```
+
+The application supplies the typed receiving variable:
+
+```harbour
+LOCAL ListOfFormattedCustomerOrders WorkArea
+
+nRows := hn_SQLSelect(cSQL, ;
+    hBindings=hBindings, ;
+    xResult=@ListOfFormattedCustomerOrders)
 ```
 
 The Hash key is `"orderFormatter"`. `FormatOrder` is the method selected on that object; the application does not need a separate Hash entry for every method. HN's normal method visibility, argument rules, synchronization behavior, and errors continue to apply.
@@ -489,7 +691,15 @@ SELECT ListOfCustomers.customer_id AS CustomerId TYPE Integer NOT NULL,
        ListOfCustomers.customer_name AS CustomerName
            TYPE Text(MaxLength = 120, MaxStorageBytes = 480)
 FROM ListOfCustomers
-INTO CURSOR ListOfValidatedCustomers
+INTO CURSOR
+```
+
+The receiving binding is supplied by the HN call:
+
+```harbour
+LOCAL ListOfValidatedCustomers WorkArea
+
+nRows := hn_SQLSelect(cSQL, xResult=@ListOfValidatedCustomers)
 ```
 
 These declarations make several promises explicit:
@@ -508,7 +718,7 @@ For example, `TYPE Integer` does not parse a numeric-looking Text value. `TYPE F
 
 The check uses the value already produced. HN does not call a function a second time merely to validate its return.
 
-A failed query does not publish a partly populated replacement result. Under the query API's publication contract, the previous destination remains available when a recoverable execution failure prevents publication. Explicit side effects performed by application callbacks remain the application's responsibility.
+A failed query does not publish a partly populated replacement result. The engine makes no result assignment when a recoverable execution failure prevents publication. Explicit callback side effects and concurrent application assignments retain their own effects; failure does not restore an earlier snapshot of the receiving variable.
 
 ### Character length and storage length are different
 
@@ -527,7 +737,15 @@ When a query directly selects a field, its declared value metadata follows that 
 ```sql
 SELECT ListOfCustomers.customer_name AS CustomerName
 FROM ListOfCustomers
-INTO CURSOR ListOfCustomerNames
+INTO CURSOR
+```
+
+The result is received with:
+
+```harbour
+LOCAL ListOfCustomerNames WorkArea
+
+nRows := hn_SQLSelect(cSQL, xResult=@ListOfCustomerNames)
 ```
 
 Renaming the field does not make it lose its type contract. This remains true when the query returns no rows, or when every selected value is NULL. The schema comes from declarations rather than from inspecting the first row or measuring the longest value currently present.
@@ -541,6 +759,8 @@ The engine also accounts for the query's meaning. An outer join can make a resul
 ### Describe the schema before consuming records
 
 `hn_SQLDescribe()` derives the output schema without scanning records or executing HN functions and methods from the query. `hn_CursorDescribe()` provides metadata for an existing Cursor or WorkArea.
+
+`hn_SQLDescribe()` does not receive or populate `xResult`. The output-reference requirement belongs to execution with `hn_SQLSelect()`; description creates no result WorkArea, publishes no output, and does not select or reposition a view.
 
 This is useful for report engines, exporters, generic data components, and tooling. They can inspect names, types, nullability, and value properties even when a dataset is empty. Description does not prove that every later runtime value or callback will succeed, but it provides a stable schema independently of the current data.
 
@@ -617,7 +837,7 @@ The workflow is:
 
 Materializing a result separates the data handed to the next stage from the live connection used to fetch it. Sharing Cursor data and coordinating its ownership are distinct from sharing a backend connection or transaction. Independent WorkAreas provide separate navigation; the Cursor ownership and synchronization rules govern access to the data itself.
 
-WorkArea aliases belong to an execution context. A worker's alias does not automatically become visible in another Task, and passing an alias string or WorkArea number alone does not transfer its data or ownership. The consuming function establishes its own WorkArea bindings after the permitted handoff. A typed WorkArea parameter likewise supplies a local name when a helper receives an already-admitted reference. Once those bindings are established, the final SQL uses their names directly. No explicit source-map argument is needed.
+Invocation-local and TASK STATIC WorkArea bindings remain scoped to their invocation or Task. Their names do not automatically become another Task's bindings, and passing an alias string or WorkArea number alone does not transfer data or ownership. The consuming function establishes its own bindings after the permitted handoff. A typed WorkArea parameter likewise supplies a local source name. An application GLOBAL is a deliberately shared binding available to authorized application code; it still does not override the Cursor's access or writer-ownership contract. Once permitted source bindings are established, SQL uses their names directly, while `xResult` supplies the destination. No explicit source-map argument is needed.
 
 When requests are independent and resources permit, the acquisition stage can approach the duration of the slowest request plus coordination and materialization overhead, instead of the sum of all request durations. Actual results depend on backend load, connection limits, transferred data, and the work each request performs.
 
@@ -635,10 +855,22 @@ SELECT ListOfTickets.customer_id AS CustomerId,
 FROM ListOfTickets
 WHERE ListOfTickets.status = :openStatus
 GROUP BY ListOfTickets.customer_id
-INTO CURSOR ListOfTicketCounts
+INTO CURSOR
 ```
 
-Here, the application supplies `hBindings := { "openStatus" => "Open" }`, assuming `"Open"` is the status value used by that source. The native Text value supplies its type. The next query reads the two named summaries directly:
+The application supplies the parameter and output:
+
+```harbour
+LOCAL ListOfTicketCounts WorkArea
+
+hBindings := { "openStatus" => "Open" }
+
+nRows := hn_SQLSelect(cSQL, ;
+    hBindings=hBindings, ;
+    xResult=@ListOfTicketCounts)
+```
+
+This assumes `"Open"` is the status value used by that source. The native Text value supplies its type. After both summaries succeed, the next query reads their WorkArea bindings directly:
 
 ```sql
 SELECT ListOfCustomerOrderCounts.CustomerId,
@@ -650,7 +882,15 @@ LEFT JOIN ListOfTicketCounts
     ON ListOfTicketCounts.CustomerId = ListOfCustomerOrderCounts.CustomerId
 ORDER BY ListOfCustomerOrderCounts.OrderCount DESC,
          ListOfCustomerOrderCounts.CustomerId
-INTO CURSOR ListOfCustomerServiceSummary
+INTO CURSOR
+```
+
+Its receiving variable is:
+
+```harbour
+LOCAL ListOfCustomerServiceSummary WorkArea
+
+nRows := hn_SQLSelect(cSQL, xResult=@ListOfCustomerServiceSummary)
 ```
 
 Each summary has at most one row per customer, so their join preserves that intended result shape. A customer with no matching ticket summary has NULL in `OpenTicketCount`; the presentation or an explicit application transformation can supply zero when that is the required report convention.
@@ -661,27 +901,44 @@ Every intermediate result remains a normal named WorkArea over local Cursor data
 
 ## Results remain useful to ordinary HN code
 
-The SQL Text selects the result mode. A Cursor result uses an explicit `INTO CURSOR WorkAreaName` clause, resolving a registered local destination when one exists. An object or Array result uses an actual HN destination passed by reference.
+The SQL Text selects the result representation. Every result mode supplies its value through an actual HN receiving variable passed as `xResult=@destination`.
 
 | Result mode | Application result | Output-reference argument | Successful execution return |
 | --- | --- | --- | --- |
-| `INTO CURSOR ListOfCustomerOrders` | A WorkArea over the materialized Cursor, assigned to a matching local binding or published under the wider-context name. | Not passed; a registered local target is assigned through its binding. | Number of result rows. |
-| `INTO OBJECT` | One read-only system DataObject; NULL for no rows; an error if more than one final row is produced. | Required. | `0` or `1`. |
-| `INTO OBJECTS ARRAY` | An Array of read-only DataObjects, one per row; an empty Array for no rows. | Required. | Number of result rows. |
+| `INTO CURSOR` | A WorkArea over a newly materialized Cursor, including a valid schema-bearing empty result. | Required; the destination must accept a WorkArea. | Number of result rows. |
+| `INTO OBJECT` | One read-only system DataObject; NULL for no rows; an error if more than one final row is produced. | Required; the destination must accept the object/NULL result. | `0` or `1`. |
+| `INTO OBJECTS ARRAY` | An Array of read-only DataObjects, one per row; an empty Array for no rows. | Required; the destination must accept the Array. | Number of result rows. |
 
-### Named Cursor results
+The exact Array-mode spelling is `INTO OBJECTS ARRAY`. A recoverable execution error returns `-1` through the established structured-error path.
 
-A named Cursor result is a natural choice when subsequent work needs schema inspection, record navigation, indexes, or another Local SQL operation. The application continues using the WorkArea name bound by the query, and a local result can also be passed or returned as a WorkArea value.
+### WorkArea results
 
-`hn_SQLSelect()` does not expose a Cursor handle as its return value or through `xResult`. Cursor mode requires its named SQL target and rejects an output-reference argument. A declared local receives a WorkArea reference through the registered destination binding. When needed, the application's separate `:CursorHandle` property access obtains the underlying managed Cursor reference. A zero-row result still creates a valid WorkArea with the declared schema.
+A WorkArea result is a natural choice when subsequent work needs schema inspection, record navigation, indexes, or another Local SQL operation. Its declared HN binding supplies a source name after the successful output assignment. Application code can also pass or return the WorkArea as an ordinary native value.
 
-A query targeting a registered local follows assignment semantics: successful publication supplies the new WorkArea value, and a recoverable failure preserves the local's previous value. If another reference retains its previous WorkArea, that view remains alive under the normal ownership rules. A result published under a wider-context alias requires an available name and does not silently overwrite an existing alias.
+`hn_SQLSelect()` returns the row count and assigns the WorkArea through `xResult`. It does not return a raw Cursor storage handle. A separate `:CursorHandle` access obtains the managed Cursor reference when needed.
 
-Publication occurs after successful execution and materialization, so an error does not expose a partly built result. The local result remains available while its references retain it; a wider-context result follows that context's ownership. In either case, closing an input WorkArea does not invalidate the independently materialized result. Creating a result does not automatically select its WorkArea; selection remains an ordinary application operation.
+All output assignments follow the receiving variable's ordinary type, ownership, and storage rules. Successful publication replaces its current reference, and other owners of the previous view retain their view. A result assigned to a local, retained, or global destination has the lifetime of its actual owners. There is no implicit SQL-created wider-scope name.
+
+Publication occurs after successful execution and materialization. The engine does not expose a partly built replacement. Independent application side effects remain observable, and individual output publication does not turn the complete query or several shared variables into one transaction. Closing an input WorkArea does not invalidate the independent result. Creating the result does not automatically select it.
+
+### Reusing the same variable as a source and destination
+
+A query can read the existing WorkArea and replace its receiving binding after successful materialization:
+
+```harbour
+nRows := hn_SQLSelect( ;
+    "SELECT * FROM ListOfOrders " + ;
+    "WHERE ListOfOrders.customer_id IS NOT NULL INTO CURSOR", ;
+    xResult=@ListOfOrders)
+```
+
+The executor resolves and retains the source before processing, creates an independent result, and publishes the new WorkArea only after success. It does not clear or rebind the source view before reading it. Other owners of the old WorkArea keep that view.
+
+This protects source identity and lifetime. It does not add a new snapshot guarantee for concurrently modified Cursor rows; the Cursor's normal query-consistency rules still apply.
 
 ### An Array of row objects
 
-For code that wants a collection of row objects, the SQL selects `INTO OBJECTS ARRAY`, and the function call supplies the actual receiving variable:
+For code that wants a collection of row objects, SQL selects `INTO OBJECTS ARRAY` and the call supplies the receiving variable:
 
 ```harbour
 cSQL := "SELECT ListOfOrders.order_id AS OrderId, " + ;
@@ -704,11 +961,49 @@ IF nRows < 0
 ENDIF
 ```
 
-On success, `aCustomerOrders` contains one DataObject per result row. Its properties use the selected column names or aliases, here `OrderId` and `CustomerId`, and retain the supported scalar types and NULL states. Zero rows produces an empty Array. A recoverable failure preserves the previous destination value rather than publishing a partial replacement.
+On success, `aCustomerOrders` contains one DataObject per result row. Its properties use the selected column names or aliases, here `OrderId` and `CustomerId`, and retain supported scalar types and NULL states. Zero rows produces an empty Array. A recoverable failure prevents partial engine publication.
 
-The SQL string specifies the result representation, while `@aCustomerOrders` identifies a real HN variable. Ordinary Array, object, and scalar locals are not registered as WorkArea names, so putting one of their names into an arbitrary SQL string does not identify that receiving variable. The dedicated WorkArea registration mechanism does not provide general reflection over all caller locals. Passing the Array destination explicitly also allows the same query Text to be reused with different destination variables.
+The SQL string specifies the representation; `@aCustomerOrders` identifies the actual HN receiving variable. This is the same destination mechanism as Cursor mode. Ordinary scalar, object, and Array variable names are not discovered by looking for their spelling in SQL Text.
 
 `INTO OBJECT` follows the same reference-destination pattern for a single logical row. Its zero-row result is NULL, which is valid output and independent of the non-NULL input-binding rule.
+
+## HNConvert: preserving behavior while making scope explicit
+
+HL and VFP applications often depend on aliases whose lifetimes extend beyond one routine. Conversion must preserve that intended ownership and visibility while making the HN declaration explicit.
+
+### Cursor destinations
+
+A statically named legacy destination such as:
+
+```sql
+-- Legacy source form for conversion, not native HN output syntax.
+SELECT ... INTO CURSOR ListOfOrders
+```
+
+maps to SQL ending in `INTO CURSOR` and an HN call supplying `xResult=@ListOfOrders`. The converter creates or uses an appropriate typed WorkArea declaration. A temporary local result can use LOCAL; a result deliberately shared across application routines can require a retained or GLOBAL binding.
+
+A converter must not turn every legacy alias into a short-lived LOCAL. It must also detect duplicate global definitions and narrower declarations that would hide a visible GLOBAL. Distributed declarations are collected for the whole selected application before these checks are finalized.
+
+Runtime-generated alias names, macro expressions, and arbitrary SQL Text need explicit dynamic-name handling or a clear conversion diagnostic. A Text value cannot automatically become a statically resolved HN variable. Passing a variable reference solves the static destination case without recreating dynamic PUBLIC or PRIVATE variables.
+
+### Native property names and command counts
+
+| Legacy intent | HN expression or treatment |
+| --- | --- |
+| Obtain a WorkArea/Cursor record count | Use the selected view's `:RecordCount`, with the required receiver-state checks. |
+| Obtain its current record number | Use `:RecordNumber`. |
+| Obtain the result-row count of a Local SQL query | Use the Integer returned by `hn_SQLSelect()`. |
+| Read VFP `_TALLY` | Preserve the last relevant command's processed/affected/result count; translate according to the command and its lifetime. |
+
+VFP `_TALLY` is not a universal synonym for a dataset's current record count. Its command-count role is documented in the [VFP SET TALK reference](https://vfphelp.com/vfp9/_5WN12PFMO.htm) and [SELECT reference](https://www.vfphelp.com/help/_5wn12penw.htm). For a successful SELECT, the return value from `hn_SQLSelect()` supplies the result-row count. Other commands require their own corresponding count contract.
+
+The native property names are `RecordCount` and `RecordNumber`. Changing these property names does not rename data fields, SQL output aliases, or unrelated Text values in the original application.
+
+### Global scope and module boundaries
+
+An application GLOBAL remains part of the application owner. Conversion must not make it ambiently visible in a library or HNB module. Where legacy code relies on that coupling, the converted interface passes the required WorkArea, data, callback, or supported output reference explicitly.
+
+Similarly, passing an alias spelling or WorkArea number does not transfer a dataset to another Task. Conversion must preserve the normal Task ownership and sharing rules. Global declaration visibility and Cursor access authority are separate concerns.
 
 ## How this differs from approaches in other languages
 
