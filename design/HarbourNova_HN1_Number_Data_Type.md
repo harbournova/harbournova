@@ -1,14 +1,31 @@
 # HarbourNova HN1: Why the Number Data Type Matters
 
-*Exact decimal arithmetic, PostgreSQL-aligned capacity, and consistent numeric behavior throughout the language.*
+*Exact decimal arithmetic, PostgreSQL-aligned capacity, and native support across variables, functions, collections, properties, and Globals.*
 
-This article describes the approved behavior of `Number` in HN1. The language type is named **`Number`**; “numeric” describes its purpose and its relationship to database types such as PostgreSQL `numeric`.
+**Updated October 27, 2026.** The HN1 **Number core is implemented, validated, and merged into the main development branch**, including its integration with typed `GLOBAL` variables. This article describes that implementation and identifies the remaining integrations in their own sections.
+
+The language type is named **`Number`**; “numeric” describes its purpose and its relationship to database types such as PostgreSQL `numeric`.
 
 A database can preserve a decimal value perfectly, yet an application can lose some of its digits as soon as it reads that value into an unsuitable numeric type. A calculation can look correct on screen while carrying a small approximation internally. A large total can absorb a small adjustment so completely that formatting the final result cannot recover it.
 
-HN1 addresses these problems with a native exact decimal type. `Number` supports ordinary decimal values and very large values through the same language type, automatically selects an appropriate internal representation, and keeps decimal arithmetic in the decimal domain.
+HN1 addresses these problems with a native exact decimal type. `Number` supports ordinary decimal values and very large values through the same language type, uses variable-sized decimal storage, and keeps decimal arithmetic in the decimal domain.
 
 Its capacity is substantial: **up to 131,072 digits before the decimal point and 16,383 after it**. But the benefit starts with something as small as `0.1`.
+
+## What the completed Number core includes
+
+The implementation covers the path from a decimal literal to an owned runtime value, through calculation, comparison, assignment, and formatting.
+
+| Area | Implemented behavior |
+| --- | --- |
+| Literal values | Exact decimal-point and exponent literals, including ordinary typed and untyped expressions. |
+| Arithmetic | Addition, subtraction, multiplication, decimal division, remainder, unary signs, integral powers, and supported compound and increment/decrement operators. |
+| Typed contracts | `Number(p,s)` declarations, decimal coercion, checked range, and preservation of the previous destination after a rejected numeric store. |
+| Language integration | Locals, statics, parameters, return values, references, class properties, Array elements, Hash values, and typed Globals. |
+| Comparison and keys | Exact numeric equality and ordering, strict comparison, and compatible numeric Hash keys. |
+| Conversions and output | Explicit numeric conversions, attempted conversions, and canonical decimal formatting. |
+
+Decimal integration with Cursors and Local SQL, external database adapters, persistence, and advanced decimal math builds on this core. Those capabilities are described below as follow-on work; completion of the core does not imply their completion.
 
 ## A small example with a much larger implication
 
@@ -29,14 +46,15 @@ The reason is representation. Many finite decimal fractions, including `0.1`, ha
 HN decimal literals are exact `Number` values. Under HN1 semantics:
 
 ```harbour
-local nFirst  Number := 0.1
-local nSecond Number := 0.2
+local nFirst  Number := 0.10
+local nSecond Number := 0.20
 local nResult Number := nFirst + nSecond
 
-// nResult is exactly 0.3.
+// nResult is exactly three tenths.
+// hn_ValueToText(nResult) produces "0.30".
 ```
 
-The decimal values enter the expression exactly, and addition preserves their exact decimal result.
+The decimal values enter the expression exactly, addition preserves their exact decimal result, and canonical formatting retains the meaningful decimal scale.
 
 This matters whenever a numeric result becomes a decision: whether an invoice balances, whether a quantity has reached a threshold, whether two calculated values compare equal, or whether an adjustment changes a total.
 
@@ -84,25 +102,23 @@ There is no separate public `BigNumber` that application code must select when a
 
 The limits are finite, and enormous calculations still consume memory and processing time. If a result exceeds an applicable range or resource limit, HN reports the failure. It does not silently substitute a floating-point approximation to make the operation succeed.
 
-## Small values can take a faster internal path
+## Storage adapts to the value
 
-Supporting large numbers does not require every calculation to use the most expensive representation.
+Supporting very large numbers does not require reserving the maximum possible storage for every value.
 
-HN1's design gives `Number` two complementary internal strategies. Eligible small values can use a compact representation based on an integer coefficient and a decimal scale or exponent. Larger values use variable-sized decimal storage and the multiprecision engine.
+The implemented engine stores significant decimal information in groups of four decimal digits, with separate sign, position, and retained-scale information. A value such as `19.95` needs only a small significant representation. A value with thousands of meaningful digits requires more storage and more work.
 
-For example, the decimal value `123.45` can be understood conceptually as an integer coefficient of `12345` with a scale of `2`:
+The representation is often described as base 10,000. These digit groups are held and manipulated using machine integers. Storing an exact decimal representation in binary computer memory does not turn it into binary floating-point arithmetic.
 
-```text
-12345 × 10^-2 = 123.45
-```
+Retained scale is distinct from significant digit storage. Values such as `1.2`, `1.20`, and `1.2000` can preserve their different scales without treating every displayed trailing zero as an additional significant digit group.
 
-Machine integers can store and manipulate decimal coefficients exactly.
+The engine also has specialized paths for cases such as zero operands, exact cancellation, and division by a short divisor. These reduce work where the operation permits it. There is no need to convert values to text or binary `Float` to use these paths.
 
-When an operation qualifies for the compact path, HN can use checked native integer arithmetic and avoid overhead associated with the general large-number path. When it needs a larger representation, HN expands the value automatically through direct numeric conversion. Decimal text is not used as an intermediate arithmetic representation.
+This gives ordinary values much smaller representations than the maximum-capacity case while retaining one public type. Applications do not select a “large number mode” or rewrite their calculations when more digits are needed.
 
-The public behavior stays the same across that transition. A value does not change its type, lose decimal digits, or acquire different equality rules because its internal representation grows.
+An additional inline small-coefficient representation remains a planned optimization. It is separate from the variable-sized storage and specialized operations already implemented. There is no published fixed small-value threshold or benchmark multiplier to claim for that future representation.
 
-This gives developers a useful combination: **lower overhead for eligible everyday values and much greater capacity when the calculation needs it**. The exact optimization depends on both the operands and the operation; it is not a promise that every small calculation uses the same path or that decimal arithmetic outperforms hardware floating point.
+The important guarantee for application code is stable: storage choices must preserve the same decimal value, scale, and numeric behavior.
 
 ## Number is a native HN type
 
@@ -118,13 +134,52 @@ local nSubtotal  Number  := nUnitPrice * iQuantity
 
 Application code uses the ordinary operators. It does not need a special string-arithmetic library or a different calling convention for every addition and multiplication.
 
-The same type belongs in local variables, parameters, return values, object properties, collection elements, Tensor cells, Cursor columns, and Local SQL expressions. A function can accept a `Number`, calculate with it, return a `Number`, and place the result into a Cursor without changing the numeric domain.
+The same type works in local and static variables, parameters, return values, reference parameters, class properties, Array elements, Hash values, and Globals. Passing a value through those supported locations preserves its decimal identity.
 
-Decimal-point and exponent literals are `Number` values. Thus `0.1`, `12.3400`, and `1e20` begin in the exact decimal domain. The compiler must preserve that meaning rather than first parsing the literal through a binary `double`.
+For example, a normal function can accept and return exact decimal values:
+
+```harbour
+function AddExact(first Number, second Number)
+   return first + second
+```
+
+Native Number values also work in ordinary collections:
+
+```harbour
+local aAmounts := { 19.95, 10.05 }
+
+aAmounts[1] += 0.10
+
+// aAmounts[1] is exactly 20.05.
+```
+
+The implementation includes supported compound assignments, prefix and postfix updates, and numeric loop handling. These paths retain numeric types and checked assignment behavior; they do not fall back to approximate arithmetic merely because a value is accessed through a collection or property.
+
+Decimal-point and exponent literals are `Number` values. Thus `0.1`, `12.3400`, and `1e20` begin in the exact decimal domain. The compiler preserves their original decimal meaning without first parsing them through a binary `double`.
+
+This also applies to ordinary untyped declarations such as `local nRate := 0.0825`. An explicit `Number` annotation is useful for a contract, but is not required merely to make a decimal literal exact.
 
 HN also retains distinct integer types and an explicit `Float` type. Integers remain useful for counts and indexes. `Number` supplies exact decimal semantics. `Float` supplies IEEE binary64 semantics when an application intentionally needs that domain.
 
 HN does not silently mix `Number` and `Float` arithmetic. Entering the approximate binary domain is an explicit choice, for example through `hn_Float(...)`.
+
+### Number in Global variables
+
+HN supports typed Globals declared outside routines:
+
+```harbour
+GLOBAL SalesTaxRate Number(7,5) := 0.08250
+
+function CalculateSalesTax(nSubtotal Number)
+   local nTax Number(12,2) := nSubtotal * SalesTaxRate
+   return nTax
+```
+
+`SalesTaxRate` can be defined in one source file and used by name from other source files in the same application. Its precision and scale remain part of its declared contract. Assignments are checked and coerced using the same Number rules as local variables.
+
+This is useful for application-wide rates, thresholds, limits, and amounts. It is a real declared binding: the compiler resolves uses of the name to the appropriate application-owned variable. Independent libraries retain their own ownership scopes.
+
+Individual Global reads and assignments are coherent. A compound update such as `SharedTotal += amount` still consists of a read, a calculation, and a write; code that permits concurrent updates needs appropriate synchronization. Declaring a Number Global does not make a sequence of updates automatically atomic.
 
 ## Arithmetic stays decimal
 
@@ -141,7 +196,11 @@ Examples of `Number` arithmetic include:
 | `2.5 ** 3` | Exactly `15.625` |
 | `1.0 / 8.0` | Exactly `0.125` |
 
-`**` is HN's exponentiation operator. The remainder operator `%` follows truncation-toward-zero quotient semantics; the nonzero remainder has the dividend's sign.
+The result column shows mathematical values. Canonical output can retain additional trailing decimal places, such as `0.30`.
+
+`**` is HN's exponentiation operator. The implemented Number operation accepts integral exponents, including integral-valued Number exponents, and uses decimal division for negative powers. Fractional exponents belong to the separate advanced-math work.
+
+The remainder operator `%` follows truncation-toward-zero quotient semantics; the nonzero remainder has the dividend's sign.
 
 ### Division does not switch to Float
 
@@ -157,11 +216,11 @@ The distinction is essential: **rounding required by a finite decimal result is 
 
 Storage capacity and an operation's result scale are also different. HN1's ordinary division rule calculates a result scale, capped at 1,000 fractional places; many divisions use far fewer. The 16,383-place capacity describes what a `Number` can retain, not a request to calculate every quotient to that many places. Even a terminating quotient can require rounding if it exceeds the selected result scale.
 
-The example uses `1.0 / 3.0` deliberately. These are `Number` operands. HN's fixed-integer division has its own truncation rules.
+The example uses `1.0 / 3.0` to make the Number operands explicit. Fixed-integer division truncates toward zero when evaluated in the integer domain; a typed Number context can also establish decimal arithmetic for literal expressions.
 
-### Decimal mathematics has defined rounding
+### Further decimal mathematics
 
-The HN1 numeric design also includes decimal operations such as square roots, exponentials, logarithms, and powers through the math API. Their `Number` forms remain in the decimal domain. Results that cannot be represented exactly, such as the square root of two, require defined decimal rounding.
+Decimal square roots, exponentials, logarithms, and nonintegral powers are planned math APIs. They are not part of the completed Number-core delivery. Their intended Number forms remain in the decimal domain, with defined rounding for results that cannot be represented exactly, such as the square root of two.
 
 The precise promise is that HN preserves the chosen numeric domain and follows its documented rules. It is not a claim that every mathematical answer has a finite exact representation.
 
@@ -183,7 +242,7 @@ nAmount := 12.345
 // nAmount becomes 12.35.
 ```
 
-`Number(10,2)` permits eight integer digits and two fractional digits. Assignment applies the destination's decimal rounding rule, then checks whether the result fits.
+`Number(10,2)` permits eight integer digits and two fractional digits. Assignment rounds halfway cases away from zero to the destination scale, then checks whether the result fits.
 
 By contrast:
 
@@ -199,11 +258,118 @@ HN's PostgreSQL-aligned declaration model permits precision from `1` through `10
 
 These declaration limits are separate from the much larger capacity of an unconstrained `Number`. The distinction matters when mapping PostgreSQL schemas into HN: a column's declared business constraints and the decimal engine's overall capacity are different pieces of information.
 
-### Decimal scale has meaning without changing numeric equality
+### Checked assignment preserves the previous value
 
-The values `1.2`, `1.20`, and `1.2000` are mathematically equal, but their retained decimal scales can differ. HN preserves meaningful scale metadata while ordinary numeric equality and compatible hashing compare the values consistently.
+A rejected numeric store leaves the previous destination intact:
 
-That allows a value to retain its intended decimal presentation without treating `1.20` as a different numerical quantity from `1.2`. Lossless persistence and database mappings must preserve the relevant scale as well as the value.
+```harbour
+local nAmount Number(5,2) := 12.34
+
+try
+   nAmount := 1000.00
+catch error HNError
+   // The new value does not fit Number(5,2).
+   // nAmount still contains exactly 12.34.
+endtry
+```
+
+The same discipline matters for compound assignment. HN evaluates the complete arithmetic expression before applying the final destination contract:
+
+```harbour
+local nAmount Number(5,2) := 1.00
+
+nAmount += 0.004 + 0.004
+
+// The exact candidate is 1.008.
+// One final constrained store produces 1.01.
+```
+
+The two small additions are not independently rounded to zero before they can contribute to the result. Range and resource failures use HN's structured error handling rather than changing the result to another numeric domain.
+
+## Equality, retained scale, and numeric keys
+
+The values `1.2`, `1.20`, and `1.2000` are mathematically equal, but their retained decimal scales can differ. HN preserves meaningful scale metadata while ordinary numeric equality compares the values.
+
+Strict comparison also considers the numeric type and its significant attributes. For Number, retained scale is one of those attributes:
+
+| Comparison | Result |
+| --- | --- |
+| `1.20 == 1.200` | True: the numerical values are equal. |
+| `1.20 === 1.200` | False: the retained scales differ. |
+
+The comparison does not depend on an allocation address or a private storage optimization.
+
+HN also implements exact mixed numeric comparison. It can compare a Number with an integer or Float according to their actual represented values, without first rounding the Number to a Float:
+
+```harbour
+hn_Number(0.5) == hn_Float(0.5)   // True.
+hn_Number(0.1) == hn_Float(0.1)   // False.
+```
+
+One half is exactly representable in binary64; one tenth is not. This comparison capability is separate from arithmetic: mixed Number/Float calculations still require an explicit choice of domain.
+
+For finite values, numeric Hash keys follow compatible numeric equality. Integer `1`, Number `1.00`, and a Float representing exactly `1` identify the same numeric key. Exact decimal `0.1` and the nearest binary64 value to `0.1` remain distinct because their values differ.
+
+This keeps lookup predictable when finite keys originate in different numeric types. Hash keys use a separate equivalence rule for NaN: all NaNs share one key even though ordinary NaN equality is false.
+
+## Numeric conversions and exact output
+
+The implemented public conversion family makes the numeric boundary explicit:
+
+| API | Purpose |
+| --- | --- |
+| `hn_Number(xValue)` | Convert a present fixed integer, Number, or Float to Number. |
+| `hn_Float(xValue)` | Explicitly convert a supported numeric value to binary64. |
+| `hn_ConvertToNumber(...)`, `hn_ConvertToFloat(...)` | Attempt a numeric conversion, returning a Boolean and writing through the result reference. |
+| `hn_ConvertToSmallInteger(...)`, `hn_ConvertToInteger(...)`, `hn_ConvertToBigInteger(...)` | Attempt an exact checked conversion to the selected bounded integer type. |
+| `hn_ValueToText(number)` | Produce canonical decimal text that preserves the Number value and retained scale. |
+
+**The current `hn_Number()` constructor accepts numeric values. It is not a general decimal-text parser.** For example, `hn_Number("19.95")` is not a supported Text conversion. The attempted numeric conversions also require numeric input. A public text-parsing API is a separate boundary.
+
+This does not affect source literals: writing `19.95` directly in HN source already creates an exact Number.
+
+### Converting an existing Float
+
+`hn_Number(Float)` preserves the actual binary64 value exactly. It does not reinterpret the Float's friendly display text as the number a person originally intended.
+
+For example:
+
+```harbour
+local fApproximate Float := hn_Float(0.1)
+local nImported Number := hn_Number(fApproximate)
+```
+
+The exact decimal value imported into `nImported` is:
+
+```text
+0.1000000000000000055511151231257827021181583404541015625
+```
+
+The conversion is faithful: it preserves the value that was actually in the Float. It cannot recover an original decimal value that was discarded during an earlier approximate conversion.
+
+Conversely, `hn_Float(Number)` explicitly rounds the exact value into binary64 using nearest-even rounding. Applications choose that boundary deliberately.
+
+### Attempting a conversion
+
+The attempted conversions use this common shape:
+
+```text
+hn_ConvertTo<Type>(xValue, @xResult [, @errError]) -> Boolean
+```
+
+For an ordinary representability failure, they return false and preserve the result variable:
+
+```harbour
+local iResult Integer := 7
+local lConverted Boolean := hn_ConvertToInteger(12.5, @iResult)
+
+// lConverted is false: 12.5 is not an exact Integer.
+// iResult remains 7.
+```
+
+An optional error result can describe that failure. Invalid argument contracts and resource or allocation failures still use canonical HNError handling; these functions are not a way to suppress every possible error.
+
+Canonical `hn_ValueToText(Number)` output preserves the exact decimal value and scale using a decimal point, without localized grouping or padding. For example, the exact sum of `0.10` and `0.20` formats as `0.30`. Number also supports the special values `NaN`, `Infinity`, and `-Infinity`, with HN-defined comparison and arithmetic rules.
 
 ## Exact arithmetic still needs a rounding policy
 
@@ -225,7 +391,7 @@ All the intermediates in this example have finite exact decimal representations.
 
 An application that rounds the discounted line before calculating tax is applying a different policy and may obtain a different result. `Number` makes that policy explicit and reproducible by removing unintended binary representation error from the calculation.
 
-HN's rounding design includes choices such as half away from zero and half even. PostgreSQL-compatible constrained assignment uses the appropriate decimal coercion rule; an explicit rounding operation lets an application select its required policy.
+The implemented constrained assignment uses PostgreSQL-compatible rounding, with halfway cases rounded away from zero. Public APIs for explicitly choosing among rounding modes, including half even, remain planned functionality. The current core already lets an application choose where to impose a declared scale.
 
 ## Database parity that matters in application code
 
@@ -241,7 +407,7 @@ Other major databases also provide exact decimal types:
 | [MySQL 8.4 `DECIMAL`][mysql-decimal] | Up to **65 total digits**, including up to **30 fractional digits** | Scale cannot exceed total precision. |
 | [Oracle `NUMBER(p,s)`][oracle-number] | Up to **38 significant digits of declared precision** | Scale has a separate range, including negative values; this is not a 38-integer-plus-38-fractional limit. |
 
-HN therefore has capacity to represent the ordinary finite decimal values from these database types without reducing them to a conventional binary double.
+HN therefore has capacity to represent the ordinary finite decimal values from these database types without reducing them to a conventional binary double. The completed core supplies that representation and its arithmetic; provider-specific decimal adapters and their end-to-end round-trip qualification remain follow-on work.
 
 For example, a database value such as:
 
@@ -257,13 +423,13 @@ Likewise, writing a result back must respect the destination column. A value tha
 
 PostgreSQL alignment also does not mean every HN language rule is identical to SQL behavior. Special-value comparisons, NULL handling, error reporting, and other language rules remain explicitly defined by HN. Matching capacity provides the foundation; matching the relevant expression and conversion semantics is what makes an interchange reliable.
 
-## The same numeric model in Cursors and Local SQL
+## Next integration: Number in Cursors and Local SQL
 
-The benefit becomes much greater when `Number` is used throughout the language, including HN's Local SQL engine.
+HN already has a Local SQL engine. Connecting the completed exact Number core to decimal Cursor transport, SQL expressions, and decimal aggregates is a separate integration step.
 
-A Cursor is a local structured collection of rows with named, typed columns. When a column contains `Number` values, its decimal identity must remain intact while HN filters, calculates, compares, groups, and aggregates those values.
+A Cursor is a local structured collection of rows with named, typed columns. The intended Number integration preserves a decimal column's identity while HN filters, calculates, compares, groups, and aggregates its values.
 
-Consider a Cursor named `InvoiceLines`, where `UnitPrice` is `Number` and `Quantity` is an integer. The following query illustrates the calculation:
+For example, consider a Cursor named `InvoiceLines`, where `UnitPrice` is Number and `Quantity` is an integer. This query illustrates the intended decimal integration:
 
 ```sql
 SELECT
@@ -273,34 +439,41 @@ FROM InvoiceLines
 GROUP BY CustomerId;
 ```
 
-`UnitPrice * Quantity` stays in the decimal domain. The aggregate returns a `Number`. The Local SQL implementation does not need a parallel floating-point interpretation of the same business calculation.
+The required decimal behavior is for `UnitPrice * Quantity` to remain Number and for the aggregate to return Number.
 
-HN's numeric aggregate contracts include:
+The approved aggregate directions include:
 
-| Aggregate input | Result type |
+| Aggregate input | Intended result type |
 | --- | --- |
 | `SUM(Number)` | `Number` |
 | `AVG(Number)` | `Number` |
 | `SUM(BigInteger)` | `Number` |
 | `AVG(Integer)` or `AVG(BigInteger)` | `Number` |
 
-An average may require rounded decimal division. A sum over exact decimal inputs does not become a float merely because it is evaluated by SQL.
+An average may require rounded decimal division; an exact decimal sum must not become a Float merely because SQL evaluates it.
 
-This supports a consistent flow: a backend decimal becomes a `Number` in a Cursor, HN code and Local SQL calculate with it, and a result Cursor retains the same decimal type. Multiple data sources can contribute decimal values to local processing without requiring the application to abandon their precision.
+The intended flow is valuable: a backend decimal enters a Cursor as Number, HN code and Local SQL calculate with it, and a result Cursor retains the same decimal type. Matching business rounding boundaries remains necessary.
 
-The practical benefit is easier reasoning about the whole calculation. Moving an expression between procedural HN code and Local SQL should not introduce an accidental numeric-domain conversion. Matching business rounding boundaries still matters in both places.
+The implemented Number core now provides the arithmetic and value semantics for that work. Completing the adapters and query paths will carry those guarantees through the full database-to-application workflow.
 
-## Preserving accuracy at the application boundaries
+## Remaining integrations and planned extensions
 
-`Number` works best when the application preserves decimal meaning from input to output.
+The core's value model is the foundation for several additional capabilities:
 
-Original decimal text and decimal-aware database values can enter the exact domain directly. An already approximate binary float is a different input: it contains the binary value that was actually stored, which may differ from the decimal value a person originally typed.
+| Area | Direction beyond the completed Number core |
+| --- | --- |
+| Cursor and Local SQL decimals | Native decimal transport, expression handling, result columns, and the appropriate aggregate contracts. |
+| Database and DataWharf adapters | Preserve exact decimal values and applicable precision/scale metadata on input and output. |
+| Persistence and reload | Preserve the semantic decimal value, retained scale, and special-value identity independently of private runtime storage. |
+| Tensor cells | Carry native Number values through the Tensor implementation and its supported storage paths. |
+| Advanced decimal math | Decimal square roots, exponentials, logarithms, and nonintegral powers with defined result precision and rounding. |
+| Selectable rounding APIs | Explicit application selection among the approved rounding modes. |
+| Public decimal-text parsing | A separate parsing interface; current numeric constructors remain numeric-only. |
+| Additional compact storage | A possible inline small-coefficient path that preserves the existing public Number semantics. |
 
-HN makes that distinction explicit. Converting a `Float` to `Number` preserves the actual binary64 value exactly; it does not silently reinterpret a friendly display string as the original number. A conversion can preserve information that exists, but it cannot infer information that has already been lost.
+The boundary principle is the same in each case: preserve decimal meaning from the original input to the final output. An external component that reduces all numbers to binary doubles has already imposed a narrower contract. Converting its result back to Number cannot reconstruct discarded information.
 
-The same principle applies to external libraries and serialization formats. An interface that represents all numbers as binary doubles has a narrower numeric contract. An exact decimal path must be selected when decimal fidelity is required.
-
-Within HN, the compact or large internal representation remains an implementation detail. Lossless persistence preserves the semantic decimal value and retained scale, so a reload does not depend on whichever internal optimization happened to be active when the value was saved.
+For lossless persistence, a saved Number must describe its semantic value and scale. Reloading it should not depend on an allocation layout, an address, or whichever internal optimization was active when it was saved.
 
 ## Why this is an important HN1 feature
 
@@ -308,18 +481,21 @@ It is easy to judge a numeric type by the largest number it can hold. For most a
 
 - Does `0.1` mean exactly one tenth?
 - Can a small adjustment survive when added to a large total?
-- Does a database decimal retain its digits in application memory?
-- Do a function and a Local SQL query use the same decimal semantics?
+- Does a function, property, collection, or Global retain the value's decimal identity?
 - Does rounding occur at the boundary the application chose?
-- Can an ordinary value grow without forcing a public type change?
+- Can a rejected assignment leave the previous valid value intact?
+- Do numeric comparison and Hash lookup agree?
+- Can the same type represent both an everyday price and a high-precision database amount?
 
-HN1's `Number` brings those concerns into one native language type. Its automatic compact representation addresses common-case overhead, its large decimal engine supplies capacity, and its integration across variables, collections, Cursors, and Local SQL protects the calculation as it moves through an application.
+The completed Number core addresses these concerns through the language's normal expressions and storage locations. Its capacity makes large values possible, its exact decimal arithmetic makes everyday calculations dependable, and its typed contracts make rounding and representability visible.
 
-**The result is a stronger foundation for software whose numbers must retain their decimal meaning from the first input to the final result.**
+The remaining Cursor, SQL, adapter, and persistence work extends that foundation across more of the application. The core already supplies the decimal values and operations those integrations need.
+
+**Number makes decimal accuracy a property of ordinary HN code—from the literal you write to the value you calculate, store, compare, and display.**
 
 ## References
 
-The HN behavior described above follows the approved HN1 numeric design. The references below document the external database comparisons and floating-point background.
+The implementation status above reflects the Number core integrated on October 27, 2026. Planned integrations are identified separately. The references below document the external database comparisons and floating-point background.
 
 1. [PostgreSQL 18: Numeric Types][pg-numeric]
 2. [Microsoft SQL Server: decimal and numeric][sqlserver-numeric]
