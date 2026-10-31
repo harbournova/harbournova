@@ -2,7 +2,7 @@
 
 **Developer overview of HN1 multiple returns and matching-target assignment — October 31, 2026**
 
-> **Scope:** This article describes the implemented HN1 feature for functions, methods, and APIs with an explicit multiple-result contract. Examples use application-defined helpers unless an existing HN API is identified by name.
+> **Scope:** This article describes the implemented HN1 feature for functions, methods, and APIs with an explicit multiple-result contract. Examples use application-defined helpers, existing HN APIs, and one explicitly identified proposed API.
 
 An application operation often produces more than one useful answer. Allocating stock produces an allocated quantity and a backordered quantity. A lookup can produce a found/not-found indication together with the requested information. A validation operation can produce a usable value or structured information explaining why it could not produce one.
 
@@ -138,16 +138,14 @@ It needs an explicit `RETURNS (Integer, Text)` clause. The same requirement appl
 
 NULL occupies a result position just as another value does. It neither removes that position nor shifts later results to the left.
 
-There is a useful distinction between **source result annotations** and **receiving-variable declarations**. In HN1, source-level `RETURNS` annotations admit NULL. Write `RETURNS (Integer, Text)`, without adding `?` to either result type. The `RETURNS` grammar does not accept the nullable suffix.
-
-Receiving variables apply their own nullability rules. For example, an Integer or Number receiving variable that may receive NULL needs its normal nullable declaration, such as `Integer?` or `Number(5,2)?`. The Text and Error variables used in this article permit NULL under their ordinary declaration rules, without that suffix.
+In HN1, source-level `RETURNS` annotations admit NULL. For example, `RETURNS (Integer, Text)` declares two result positions, either of which may contain NULL. Each receiving variable still applies its own type and value constraints.
 
 Here is a small lookup example. The helper recognizes one warehouse so that both outcomes are visible without requiring a database or another API:
 
 ```harbour
 FUNCTION DemonstrateWarehouseLookup()
     LOCAL lFound Boolean
-    LOCAL iAvailable Integer?
+    LOCAL iAvailable Any
     LOCAL cWarehouse Text
 
     lFound, iAvailable, cWarehouse := FindWarehouseStock(1)
@@ -170,9 +168,9 @@ FUNCTION FindWarehouseStock(iWarehouseId Integer Required) ;
 
 The unsuccessful lookup still returns three values. The Boolean distinguishes an unsuccessful lookup from a successful lookup whose quantity happens to be zero. That meaning belongs to this helper's documented convention; HN does not automatically interpret the first result as a success flag.
 
-Using a nonnullable `LOCAL iAvailable Integer` would not change what the function may return. It would make the NULL outcome incompatible with that destination, causing the receiving assignment to fail before writing any of its results.
+The example uses an `Any` receiving variable so it can hold either the Integer quantity or NULL. The function's second result remains declared as Integer. Choosing an `Any` destination does not change that result declaration or convert the returned value.
 
-Native APIs can publish their own applicable result contracts, including nonnullable contracts. Their documented restrictions still apply, including to discarded results. The source-level rule above must not be generalized into permission to return NULL from every native API position.
+Native APIs retain their documented result contracts. Multiple returns do not relax those contracts, including when a caller discards a result.
 
 ### Every normal return supplies the complete shape
 
@@ -528,6 +526,8 @@ Changing an API's result count, order, or contract is an interface change. Even 
 
 `Error` is a normal result type using HN's established structured error value. `HNError` remains the accepted spelling in a catch declaration. Returning an Error value does not, by itself, throw an exception, invoke unhandled-error reporting, or preserve other receiving variables.
 
+The examples in this section assume the NULL-safe native properties `:IsNull` and `:IsNotNull` are available on Error variables. `oError:IsNull` is TRUE when `oError` contains NULL and FALSE when it contains an Error. `oError:IsNotNull` gives the opposite result. These are properties, so the checks do not use parentheses.
+
 An API can deliberately define a `(value, error)` convention. The following application helper treats a checked Text-length failure as a returned error. It uses a small scalar helper so the example needs no invented error-construction API:
 
 ```harbour
@@ -548,7 +548,7 @@ FUNCTION DemonstrateCodeValidation()
 
     cCandidate, errValidation := TryWarehouseCode("WAREHOUSE-TOO-LONG")
 
-    IF hn_IsNull(errValidation)
+    IF errValidation:IsNotNull
         cStoredCode := cCandidate
     ENDIF
 
@@ -567,6 +567,56 @@ The candidate variable is significant. If the caller wrote directly into `cStore
 A Boolean status can also be useful, especially when “not found,” “unchanged,” or “cancelled by the user” are ordinary application outcomes. HN does not enforce any relationship between a Boolean result, another returned value, and an Error result. Document those relationships as part of the API.
 
 Multiple returns do not replace exceptions. A function that raises an exception and does not convert it into ordinary results follows the established exception path. Discarding an Error position does not catch such an exception. Existing `TRY`, `CATCH`, `FINALLY`, rethrow, and primary/suppressed-error rules continue to apply.
+
+### An illustrative HN API with an Error result
+
+A new HN API can expose the same convention directly. Consider a proposed `hn_ReadTextFile()` API with this interface:
+
+```text
+FUNCTION hn_ReadTextFile(cPath Text Required) RETURNS (Text, Error)
+```
+
+The API name and signature are illustrative; this example does not identify an already implemented file API. It uses the same assumed NULL-safe native Error properties as the preceding example.
+
+For this proposed API, the contract defines the following outcomes:
+
+| Outcome | First result: Text | Second result: Error | `oError:IsNull` | `oError:IsNotNull` |
+| --- | --- | --- | --- | --- |
+| The file is read successfully. | The file contents. | NULL. | TRUE. | FALSE. |
+| An empty file is read successfully. | Empty Text, `""`. | NULL. | TRUE. | FALSE. |
+| An expected read failure occurs, such as a missing or inaccessible file. | NULL. | An Error describing the failure. | FALSE. | TRUE. |
+
+The application receives both results from one call and checks the returned Error:
+
+```harbour
+FUNCTION DisplayTextFile(cPath Text Required) RETURNS Boolean
+    LOCAL cContents Text
+    LOCAL oError Error
+
+    cContents, oError := hn_ReadTextFile(cPath)
+
+    IF oError:IsNotNull
+        // oError contains the structured failure information.
+        // Application-specific handling can inspect or report that Error.
+        ? "Could not read the file:", cPath
+        RETURN FALSE
+    ENDIF
+
+    ? cContents
+    RETURN TRUE
+
+FUNCTION DemonstrateFileRead()
+    LOCAL lDisplayed Boolean
+
+    lDisplayed := DisplayTextFile("settings.txt")
+    RETURN NULL
+```
+
+`oError` is the second **returned value**, not an output parameter supplied to the API. The receiving statement associates the file contents and any failure information with the same invocation. No `@` argument is needed for either result.
+
+Both properties are safe to evaluate when no Error was returned. For this API's convention, `IF oError:IsNull` selects the success path, while `IF oError:IsNotNull` selects the reported-failure path. An empty file is still a successful read because its Error result is NULL; empty contents do not imply failure.
+
+On a reported read failure, the matching-target assignment completes normally and assigns both NULL to `cContents` and the Error to `oError`. The subsequent `IF` handles the unsuccessful operation. An exception that propagates instead still follows HN's normal exception path; the property check does not catch it.
 
 ## Boundaries to keep in mind
 
